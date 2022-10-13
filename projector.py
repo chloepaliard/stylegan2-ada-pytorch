@@ -76,9 +76,9 @@ def project(
     w_noise_init = torch.randn_like(w_opt) * w_std * initial_noise_factor
     ws_init = (w_opt + w_noise_init).repeat([1, G.mapping.num_ws, 1])
     s_avg = G_out_s.synthesis(ws_init, noise_mode='const')
-    
-    s_avg_concat = np.concatenate((w_avg[0], s_avg[0].detach().cpu().numpy()), axis=1)
-    for idx in range (1, len(s_avg)):
+
+    s_avg_concat = np.concatenate((s_avg[0].detach().cpu().numpy(), s_avg[1].detach().cpu().numpy()), axis=1)
+    for idx in range (2, len(s_avg)):
         s_avg_concat = np.concatenate((s_avg_concat, s_avg[idx].detach().cpu().numpy()), axis=1)
 
     # w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
@@ -86,10 +86,9 @@ def project(
     # w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
     # optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
     
-    s_w_opt = torch.tensor(s_avg_concat, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
-    # s_w_opt = torch.cat((w_opt[0], s_opt), 1)
-    s_out = torch.zeros([num_steps] + list(s_w_opt.shape[1:]), dtype=torch.float32, device=device)
-    optimizer = torch.optim.Adam([s_w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
+    s_opt = torch.tensor(s_avg_concat, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+    s_out = torch.zeros([num_steps] + list(s_opt.shape[1:]), dtype=torch.float32, device=device)
+    optimizer = torch.optim.Adam([s_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
 
     # Init noise.
     for buf in noise_bufs.values():
@@ -114,11 +113,9 @@ def project(
         # synth_images = G.synthesis(ws, noise_mode='const')
 
         # Synth images from s_opt.
-        w_opt = torch.unsqueeze(s_w_opt[:, :512], 0)
-        w_noise = torch.randn_like(w_opt) * w_noise_scale
-        w = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
-        s_opt = s_w_opt[:, 512:]
-        synth_images = G.synthesis(w, s_opt, noise_mode='const')
+        s_noise = torch.randn_like(s_opt) * w_noise_scale
+        s = s_opt + s_noise
+        synth_images = G.synthesis(s, noise_mode='const')
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
         synth_images = (synth_images + 1) * (255/2)
@@ -149,7 +146,7 @@ def project(
 
         # Save projected W for each optimization step.
         # w_out[step] = w_opt.detach()[0]
-        s_out[step] = s_w_opt.detach()[0]
+        s_out[step] = s_opt.detach()[0]
 
         # Normalize noise.
         with torch.no_grad():
@@ -212,7 +209,7 @@ def run_projection(
     # Optimize projection.
     start_time = perf_counter()
     # projected_w_steps = project(
-    projected_w_s_steps = project(
+    projected_s_steps = project(
         G,
         G_out_s,
         target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
@@ -229,10 +226,8 @@ def run_projection(
         print (f'Saving optimization progress video "{outdir}/proj.mp4"')
         # for projected_w in projected_w_steps:
         #     synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
-        for projected_w_s in projected_w_s_steps:
-            projected_w = torch.unsqueeze(projected_w_s[:512], 0)
-            projected_s = projected_w_s[512:]
-            synth_image = G.synthesis(projected_w.unsqueeze(0), projected_s, noise_mode='const')
+        for projected_s in projected_s_steps:
+            synth_image = G.synthesis(projected_s.unsqueeze(0), noise_mode='const')
             synth_image = (synth_image + 1) * (255/2)
             synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
             video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
@@ -242,10 +237,8 @@ def run_projection(
     target_pil.save(f'{outdir}/target.png')
     # projected_w = projected_w_steps[-1]
     # synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
-    projected_w_s = projected_w_s_steps[-1]
-    projected_w = torch.unsqueeze(projected_w_s[:512], 0)
-    projected_s = projected_w_s[512:]
-    synth_image = G.synthesis(projected_w.unsqueeze(0), projected_s, noise_mode='const')
+    projected_s = projected_s_steps[-1]
+    synth_image = G.synthesis(projected_s.unsqueeze(0), noise_mode='const')
     synth_image = (synth_image + 1) * (255/2)
     synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
     PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
