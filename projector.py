@@ -25,11 +25,11 @@ from training import networks
 
 def project(
     G,
-    G_out_s,
     target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
     *,
+    proj_space,
     num_steps                  = 1000,
-    w_avg_samples              = 10000,
+    w_avg_samples              = 10,
     initial_learning_rate      = 0.1,
     initial_noise_factor       = 0.05,
     lr_rampdown_length         = 0.25,
@@ -45,8 +45,19 @@ def project(
         if verbose:
             print(*args)
 
-    G = copy.deepcopy(G).eval().requires_grad_(False).to(device) # type: ignore
-    G_out_s = copy.deepcopy(G_out_s).eval().requires_grad_(False).to(device) # type: ignore
+    if (proj_space == 's'):
+    
+        G_old = copy.deepcopy(G).eval().requires_grad_(False).to(device) # type: ignore
+
+        G = networks.Generator_from_S(G_old.z_dim, G_old.c_dim, G_old.w_dim, G_old.img_resolution, G_old.img_channels).eval().requires_grad_(False).to(device)
+        G.load_state_dict(G_old.state_dict())
+
+        G_out_s = networks.Generator_out_S(G_old.z_dim, G_old.c_dim, G_old.w_dim, G_old.img_resolution, G_old.img_channels).eval().requires_grad_(False).to(device)
+        G_out_s.load_state_dict(G_old.state_dict())
+
+    else:
+        G = copy.deepcopy(G).eval().requires_grad_(False).to(device) # type: ignore
+
 
     # Compute w stats.
     logprint(f'Computing W midpoint and stddev using {w_avg_samples} samples...')
@@ -54,7 +65,8 @@ def project(
     w_samples = G.mapping(torch.from_numpy(z_samples).to(device), None)  # [N, L, C]
     w_samples = w_samples[:, :1, :].cpu().numpy().astype(np.float32)       # [N, 1, C]
     w_avg = np.mean(w_samples, axis=0, keepdims=True)      # [1, 1, C]
-    # w_plus_avg = w_avg.repeat(G.mapping.num_ws, axis=1)  # [1, L, C] (L = #layers)
+    if (proj_space == 'w_plus'):
+        w_plus_avg = w_avg.repeat(G.mapping.num_ws, axis=1)  # [1, L, C] (L = #layers)
     w_std = (np.sum((w_samples - w_avg) ** 2) / w_avg_samples) ** 0.5
 
     # Setup noise inputs.
@@ -71,24 +83,30 @@ def project(
         target_images = F.interpolate(target_images, size=(256, 256), mode='area')
     target_features = vgg16(target_images, resize_images=False, return_lpips=True)
 
-    # Get s_avg from w_avg
-    w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True)
-    w_noise_init = torch.randn_like(w_opt) * w_std * initial_noise_factor
-    ws_init = (w_opt + w_noise_init).repeat([1, G.mapping.num_ws, 1])
-    s_avg = G_out_s.synthesis(ws_init, noise_mode='const')
+    if (proj_space == 's'):
+        w_avg_tensor = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True)
+        w_noise_init = torch.randn_like(w_avg_tensor) * w_std * initial_noise_factor
+        ws_init = (w_avg_tensor + w_noise_init).repeat([1, G.mapping.num_ws, 1])
+        s_avg = G_out_s.synthesis(ws_init, noise_mode='const')  # Get initial s from initial w
 
-    s_avg_concat = np.concatenate((s_avg[0].detach().cpu().numpy(), s_avg[1].detach().cpu().numpy()), axis=1)
-    for idx in range (2, len(s_avg)):
-        s_avg_concat = np.concatenate((s_avg_concat, s_avg[idx].detach().cpu().numpy()), axis=1)
+        # Concatenate style vectors to make one vector
+        s_avg_concat = np.concatenate((s_avg[0].detach().cpu().numpy(), s_avg[1].detach().cpu().numpy()), axis=1)
+        for idx in range (2, len(s_avg)):
+            s_avg_concat = np.concatenate((s_avg_concat, s_avg[idx].detach().cpu().numpy()), axis=1)
+        
+        # S vector to optimize:
+        opt = torch.tensor(s_avg_concat, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
 
-    # w_opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
-    # w_opt = torch.tensor(w_plus_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
-    # w_out = torch.zeros([num_steps] + list(w_opt.shape[1:]), dtype=torch.float32, device=device)
-    # optimizer = torch.optim.Adam([w_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
-    
-    s_opt = torch.tensor(s_avg_concat, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
-    s_out = torch.zeros([num_steps] + list(s_opt.shape[1:]), dtype=torch.float32, device=device)
-    optimizer = torch.optim.Adam([s_opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
+    elif (proj_space == 'w'):
+        # W vector to optimize:
+        opt = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+
+    else:
+        # W+ vector to optimize:
+        opt = torch.tensor(w_plus_avg, dtype=torch.float32, device=device, requires_grad=True) # pylint: disable=not-callable
+
+    out = torch.zeros([num_steps] + list(opt.shape[1:]), dtype=torch.float32, device=device)
+    optimizer = torch.optim.Adam([opt] + list(noise_bufs.values()), betas=(0.9, 0.999), lr=initial_learning_rate)
 
     # Init noise.
     for buf in noise_bufs.values():
@@ -106,16 +124,13 @@ def project(
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # # Synth images from opt_w.
-        # w_noise = torch.randn_like(w_opt) * w_noise_scale
-        # ws = (w_opt + w_noise).repeat([1, G.mapping.num_ws, 1])
-        # # ws = w_opt + w_noise
-        # synth_images = G.synthesis(ws, noise_mode='const')
-
-        # Synth images from s_opt.
-        s_noise = torch.randn_like(s_opt) * w_noise_scale
-        s = s_opt + s_noise
-        synth_images = G.synthesis(s, noise_mode='const')
+        # Synth images from opt
+        noise = torch.randn_like(opt) * w_noise_scale
+        if (proj_space == 'w'):
+            G_in = (opt + noise).repeat([1, G.mapping.num_ws, 1])
+        else:
+            G_in = opt + noise
+        synth_images = G.synthesis(G_in, noise_mode='const')
 
         # Downsample image to 256x256 if it's larger than that. VGG was built for 224x224 images.
         synth_images = (synth_images + 1) * (255/2)
@@ -142,11 +157,10 @@ def project(
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        logprint(f'step {step+1:>4d}/{num_steps}: dist {dist:<4.2f} loss {float(loss):<5.2f}')
+        logprint(f'step {step+1:>4d}/{num_steps}: dist {dist:<4.4f} loss {float(loss):<5.4f}')
 
         # Save projected W for each optimization step.
-        # w_out[step] = w_opt.detach()[0]
-        s_out[step] = s_opt.detach()[0]
+        out[step] = opt.detach()[0]
 
         # Normalize noise.
         with torch.no_grad():
@@ -154,22 +168,25 @@ def project(
                 buf -= buf.mean()
                 buf *= buf.square().mean().rsqrt()
 
-    # return w_out.repeat([1, G.mapping.num_ws, 1])
-    # return w_out
-    return s_out
+    if (proj_space == 'w'):
+        return out.repeat([1, G.mapping.num_ws, 1])
+    else:
+        return out
 
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
-@click.option('--target', 'target_fname', help='Target image file to project to', required=True, metavar='FILE')
-@click.option('--num-steps',              help='Number of optimization steps', type=int, default=1000, show_default=True)
-@click.option('--seed',                   help='Random seed', type=int, default=303, show_default=True)
-@click.option('--save-video',             help='Save an mp4 video of optimization progress', type=bool, default=True, show_default=True)
-@click.option('--outdir',                 help='Where to save the output images', required=True, metavar='DIR')
+@click.option('--network', 'network_pkl',   help='Network pickle filename', required=True)
+@click.option('--target', 'target_fname',   help='Target image file to project to', required=True, metavar='FILE')
+@click.option('--proj-space', 'proj_space', type=click.Choice(['w', 'w_plus', 's'], case_sensitive=False), help='Space to project into', default='w')
+@click.option('--num-steps',                help='Number of optimization steps', type=int, default=1000, show_default=True)
+@click.option('--seed',                     help='Random seed', type=int, default=303, show_default=True)
+@click.option('--save-video',               help='Save an mp4 video of optimization progress', type=bool, default=True, show_default=True)
+@click.option('--outdir',                   help='Where to save the output images', required=True, metavar='DIR')
 def run_projection(
     network_pkl: str,
     target_fname: str,
+    proj_space: str,
     outdir: str,
     save_video: bool,
     seed: int,
@@ -190,13 +207,13 @@ def run_projection(
     print('Loading networks from "%s"...' % network_pkl)
     device = torch.device('cuda')
     with dnnlib.util.open_url(network_pkl) as fp:
-        G_old = legacy.load_network_pkl(fp)['G_ema'].requires_grad_(False).to(device) # type: ignore
+        G_w = legacy.load_network_pkl(fp)['G_ema'].requires_grad_(False).to(device) # type: ignore
 
-    G = networks.Generator_from_S(G_old.z_dim, G_old.c_dim, G_old.w_dim, G_old.img_resolution, G_old.img_channels).eval().requires_grad_(False).to(device)
-    G.load_state_dict(G_old.state_dict())
-
-    G_out_s = networks.Generator_out_S(G_old.z_dim, G_old.c_dim, G_old.w_dim, G_old.img_resolution, G_old.img_channels).eval().requires_grad_(False).to(device)
-    G_out_s.load_state_dict(G_old.state_dict())
+    if (proj_space == 's'):
+        G = networks.Generator_from_S(G_w.z_dim, G_w.c_dim, G_w.w_dim, G_w.img_resolution, G_w.img_channels).eval().requires_grad_(False).to(device)
+        G.load_state_dict(G_w.state_dict())
+    else:
+        G = copy.deepcopy(G_w).eval().requires_grad_(False).to(device) # type: ignore
 
     # Load target image.
     target_pil = PIL.Image.open(target_fname).convert('RGB')
@@ -208,11 +225,10 @@ def run_projection(
 
     # Optimize projection.
     start_time = perf_counter()
-    # projected_w_steps = project(
-    projected_s_steps = project(
-        G,
-        G_out_s,
+    projected_steps = project(
+        G_w,
         target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
+        proj_space=proj_space,
         num_steps=num_steps,
         device=device,
         verbose=True
@@ -224,10 +240,8 @@ def run_projection(
     if save_video:
         video = imageio.get_writer(f'{outdir}/proj.mp4', mode='I', fps=10, codec='libx264', bitrate='16M')
         print (f'Saving optimization progress video "{outdir}/proj.mp4"')
-        # for projected_w in projected_w_steps:
-        #     synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
-        for projected_s in projected_s_steps:
-            synth_image = G.synthesis(projected_s.unsqueeze(0), noise_mode='const')
+        for projected in projected_steps:
+            synth_image = G.synthesis(projected.unsqueeze(0), noise_mode='const')
             synth_image = (synth_image + 1) * (255/2)
             synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
             video.append_data(np.concatenate([target_uint8, synth_image], axis=1))
@@ -235,15 +249,12 @@ def run_projection(
 
     # Save final projected frame and W vector.
     target_pil.save(f'{outdir}/target.png')
-    # projected_w = projected_w_steps[-1]
-    # synth_image = G.synthesis(projected_w.unsqueeze(0), noise_mode='const')
-    projected_s = projected_s_steps[-1]
-    synth_image = G.synthesis(projected_s.unsqueeze(0), noise_mode='const')
+    projected = projected_steps[-1]
+    synth_image = G.synthesis(projected.unsqueeze(0), noise_mode='const')
     synth_image = (synth_image + 1) * (255/2)
     synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
     PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
-    # np.savez(f'{outdir}/projected_w.npz', w=projected_w.unsqueeze(0).cpu().numpy())
-    np.savez(f'{outdir}/projected_s.npz', w=projected_s.unsqueeze(0).cpu().numpy())
+    np.savez(f'{outdir}/projected_{proj_space}.npz', w=projected.unsqueeze(0).cpu().numpy())
 
 #----------------------------------------------------------------------------
 
