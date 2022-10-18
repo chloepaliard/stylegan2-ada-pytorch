@@ -254,7 +254,10 @@ def run_projection(
     synth_image = (synth_image + 1) * (255/2)
     synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
     PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
-    np.savez(f'{outdir}/projected_{proj_space}.npz', w=projected.unsqueeze(0).cpu().numpy())
+    if (proj_space == 's'):
+        np.savez(f'{outdir}/projected_{proj_space}.npz', s=projected.unsqueeze(0).cpu().numpy())
+    else:
+        np.savez(f'{outdir}/projected_{proj_space}.npz', w=projected.unsqueeze(0).cpu().numpy())
 
 #----------------------------------------------------------------------------
 

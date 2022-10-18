@@ -8,6 +8,7 @@
 
 """Generate images using pretrained network pickle."""
 
+import copy
 import os
 import re
 from typing import List, Optional
@@ -19,6 +20,7 @@ import PIL.Image
 import torch
 
 import legacy
+from training import networks
 
 #----------------------------------------------------------------------------
 
@@ -41,7 +43,8 @@ def num_range(s: str) -> List[int]:
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
 @click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
-@click.option('--projected-w', help='Projection result file', type=str, metavar='FILE')
+@click.option('--projected-w', help='Projection result file from W', type=str, metavar='FILE')
+@click.option('--projected-s', help='Projection result file from S', type=str, metavar='FILE')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
 def generate_images(
     ctx: click.Context,
@@ -51,7 +54,8 @@ def generate_images(
     noise_mode: str,
     outdir: str,
     class_idx: Optional[int],
-    projected_w: Optional[str]
+    projected_w: Optional[str],
+    projected_s: Optional[str]
 ):
     """Generate images using pretrained network pickle.
 
@@ -81,7 +85,13 @@ def generate_images(
     print('Loading networks from "%s"...' % network_pkl)
     device = torch.device('cuda')
     with dnnlib.util.open_url(network_pkl) as f:
-        G = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
+        G_w = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
+
+    if projected_s is not None:
+        G = networks.Generator_from_S(G_w.z_dim, G_w.c_dim, G_w.w_dim, G_w.img_resolution, G_w.img_channels).eval().requires_grad_(False).to(device)
+        G.load_state_dict(G_w.state_dict())
+    else:
+        G = copy.deepcopy(G_w).eval().requires_grad_(False).to(device) # type: ignore
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -95,6 +105,19 @@ def generate_images(
         assert ws.shape[1:] == (G.num_ws, G.w_dim)
         for idx, w in enumerate(ws):
             img = G.synthesis(w.unsqueeze(0), noise_mode=noise_mode)
+            img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            img = PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/proj{idx:02d}.png')
+        return
+
+    # Synthesize the result of a S projection.
+    if projected_s is not None:
+        if seeds is not None:
+            print ('warn: --seeds is ignored when using --projected-s')
+        print(f'Generating images from projected s "{projected_s}"')
+        projected = np.load(projected_s)['s']
+        s_tensor = torch.tensor(projected, device=device) # pylint: disable=not-callable
+        for idx, s in enumerate(s_tensor):
+            img = G.synthesis(s.unsqueeze(0), noise_mode=noise_mode)
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
             img = PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/proj{idx:02d}.png')
         return
@@ -119,7 +142,6 @@ def generate_images(
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
-
 
 #----------------------------------------------------------------------------
 
