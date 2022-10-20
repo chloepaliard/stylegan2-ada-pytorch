@@ -28,8 +28,9 @@ def project(
     target: torch.Tensor, # [C,H,W] and dynamic range [0,255], W & H must match G output resolution
     *,
     proj_space,
-    num_steps                  = 1000,
-    w_avg_samples              = 10,
+    num_steps,
+    w_avg_samples,
+    seed,
     initial_learning_rate      = 0.1,
     initial_noise_factor       = 0.05,
     lr_rampdown_length         = 0.25,
@@ -61,7 +62,7 @@ def project(
 
     # Compute w stats.
     logprint(f'Computing W midpoint and stddev using {w_avg_samples} samples...')
-    z_samples = np.random.RandomState(123).randn(w_avg_samples, G.z_dim)
+    z_samples = np.random.RandomState(seed).randn(w_avg_samples, G.z_dim)
     w_samples = G.mapping(torch.from_numpy(z_samples).to(device), None)  # [N, L, C]
     w_samples = w_samples[:, :1, :].cpu().numpy().astype(np.float32)       # [N, 1, C]
     w_avg = np.mean(w_samples, axis=0, keepdims=True)      # [1, 1, C]
@@ -85,9 +86,8 @@ def project(
 
     if (proj_space == 's'):
         w_avg_tensor = torch.tensor(w_avg, dtype=torch.float32, device=device, requires_grad=True)
-        w_noise_init = torch.randn_like(w_avg_tensor) * w_std * initial_noise_factor
-        ws_init = (w_avg_tensor + w_noise_init).repeat([1, G.mapping.num_ws, 1])
-        s_avg = G_out_s.synthesis(ws_init, noise_mode='const')  # Get initial s from initial w
+        w_avg_tensor = w_avg_tensor.repeat([1, G.mapping.num_ws, 1])
+        s_avg = G_out_s.synthesis(w_avg_tensor, noise_mode='const')  # Get initial s from initial w
 
         # Concatenate style vectors to make one vector
         s_avg_concat = np.concatenate((s_avg[0].detach().cpu().numpy(), s_avg[1].detach().cpu().numpy()), axis=1)
@@ -169,9 +169,9 @@ def project(
                 buf *= buf.square().mean().rsqrt()
 
     if (proj_space == 'w'):
-        return out.repeat([1, G.mapping.num_ws, 1])
+        return out.repeat([1, G.mapping.num_ws, 1]), float(loss)
     else:
-        return out
+        return out, float(loss)
 
 #----------------------------------------------------------------------------
 
@@ -180,6 +180,7 @@ def project(
 @click.option('--target', 'target_fname',   help='Target image file to project to', required=True, metavar='FILE')
 @click.option('--proj-space', 'proj_space', type=click.Choice(['w', 'w_plus', 's'], case_sensitive=False), help='Space to project into', default='w')
 @click.option('--num-steps',                help='Number of optimization steps', type=int, default=1000, show_default=True)
+@click.option('--w-avg-samples', 'w_avg_samples',  help='Number of initial samples of w', type=int, default=1, show_default=True)
 @click.option('--seed',                     help='Random seed', type=int, default=303, show_default=True)
 @click.option('--save-video',               help='Save an mp4 video of optimization progress', type=bool, default=True, show_default=True)
 @click.option('--outdir',                   help='Where to save the output images', required=True, metavar='DIR')
@@ -190,7 +191,8 @@ def run_projection(
     outdir: str,
     save_video: bool,
     seed: int,
-    num_steps: int
+    num_steps: int,
+    w_avg_samples: int,
 ):
     """Project given image to the latent space of pretrained network pickle.
 
@@ -225,14 +227,18 @@ def run_projection(
 
     # Optimize projection.
     start_time = perf_counter()
-    projected_steps = project(
+    projection = project(
         G_w,
         target=torch.tensor(target_uint8.transpose([2, 0, 1]), device=device), # pylint: disable=not-callable
         proj_space=proj_space,
         num_steps=num_steps,
+        w_avg_samples=w_avg_samples,
+        seed=seed,
         device=device,
         verbose=True
     )
+    projected_steps = projection[0]
+    loss = projection[1]
     print (f'Elapsed: {(perf_counter()-start_time):.1f} s')
 
     # Render debug output: optional video and projected image and W vector.
@@ -248,16 +254,18 @@ def run_projection(
         video.close()
 
     # Save final projected frame and W vector.
-    target_pil.save(f'{outdir}/target.png')
-    projected = projected_steps[-1]
-    synth_image = G.synthesis(projected.unsqueeze(0), noise_mode='const')
-    synth_image = (synth_image + 1) * (255/2)
-    synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
-    PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
-    if (proj_space == 's'):
-        np.savez(f'{outdir}/projected_{proj_space}.npz', s=projected.unsqueeze(0).cpu().numpy())
-    else:
-        np.savez(f'{outdir}/projected_{proj_space}.npz', w=projected.unsqueeze(0).cpu().numpy())
+    # target_pil.save(f'{outdir}/target.png')
+    # projected = projected_steps[-1]
+    # synth_image = G.synthesis(projected.unsqueeze(0), noise_mode='const')
+    # synth_image = (synth_image + 1) * (255/2)
+    # synth_image = synth_image.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)[0].cpu().numpy()
+    # PIL.Image.fromarray(synth_image, 'RGB').save(f'{outdir}/proj.png')
+    # if (proj_space == 's'):
+    #     np.savez(f'{outdir}/projected_{proj_space}.npz', s=projected.unsqueeze(0).cpu().numpy())
+    # else:
+    #     np.savez(f'{outdir}/projected_{proj_space}.npz', w=projected.unsqueeze(0).cpu().numpy())
+    np.save(f'{outdir}/loss_{w_avg_samples}_samples_{seed}', loss)
+    
 
 #----------------------------------------------------------------------------
 

@@ -81,7 +81,7 @@ def generate_edited_images(
         edition_idx = np.sum(layers[:edition_layer]) + edition_channel
 
     old_val = s[0, edition_idx]
-    s[0, edition_idx] *= alpha
+    s[0, edition_idx] += alpha
     new_val = s[0, edition_idx]
     print(f'Channel {edition_channel} of layer {edition_layer} (i.e. channel {edition_idx}) went from {old_val} to {new_val}')
 
